@@ -22,7 +22,7 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: CORS_ORIGINS
-        sync: false
+        value: https://face-verified-multi-election-voting-yljj.onrender.com,https://face-verified-multi-election-voting.onrender.com
 
   - type: web
     name: face-verified-voting-frontend
@@ -33,4 +33,4 @@ services:
     autoDeploy: true
     envVars:
       - key: REACT_APP_API_BASE_URL
-        sync: false
+        value: https://face-verified-multi-election-voting.onrender.com
