@@ -10,7 +10,37 @@ const PORT = Number(process.env.PORT) || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY || "ADMIN_SECRET_2026";
 
-app.use(cors());
+const configuredOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+const allowListedOrigins = new Set([
+  ...configuredOrigins,
+  "https://face-verified-multi-election-voting-yljj.onrender.com",
+  "https://face-verified-multi-election-voting.onrender.com",
+  "http://localhost:3000",
+]);
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowListedOrigins.has(origin)) return callback(null, true);
+
+    // Allow Render preview/custom URLs for this project without manual updates.
+    if (/^https:\/\/face-verified-multi-election-voting.*\.onrender\.com$/.test(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "5mb" }));
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/face_voting";
