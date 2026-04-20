@@ -66,6 +66,13 @@ const voterSchema = new mongoose.Schema(
     descriptor: { type: [Number], required: true },
     registeredAt: { type: Date, default: Date.now },
     faceVerified: { type: Boolean, default: false },
+    approvalStatus: {
+      type: String,
+      enum: ["pending", "approved", "rejected"],
+      default: "pending",
+    },
+    reviewedAt: { type: Date, default: null },
+    approvedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
@@ -167,6 +174,8 @@ const votingHistorySchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+votingHistorySchema.index({ electionId: 1, positionId: 1 }, { unique: true });
+
 const Voter = mongoose.model("Voter", voterSchema);
 const Admin = mongoose.model("Admin", adminSchema);
 const Position = mongoose.model("Position", positionSchema);
@@ -241,6 +250,8 @@ function euclideanDistance(a, b) {
   return Math.sqrt(sum);
 }
 
+const FACE_MATCH_THRESHOLD = Number(process.env.FACE_MATCH_THRESHOLD) || 0.6;
+
 async function getElectionResults(electionId) {
   const [election, votes, candidates, approvedApplications] = await Promise.all([
     Election.findById(electionId).populate("positionIds"),
@@ -296,6 +307,108 @@ async function getElectionResults(electionId) {
     totalVotes,
     results: rows,
   };
+}
+
+async function buildVotingHistoryRows(electionId) {
+  const election = await Election.findById(electionId).populate("positionIds");
+  if (!election) return null;
+
+  const [votes, candidates] = await Promise.all([
+    Vote.find({ electionId }),
+    Candidate.find({}).populate("positionId"),
+  ]);
+
+  const candidateMap = new Map(candidates.map((candidate) => [String(candidate._id), candidate]));
+  const votesByPosition = new Map();
+
+  votes.forEach((vote) => {
+    const positionKey = String(vote.positionId);
+    if (!votesByPosition.has(positionKey)) votesByPosition.set(positionKey, []);
+    votesByPosition.get(positionKey).push(vote);
+  });
+
+  return election.positionIds.map((position) => {
+    const positionVotes = votesByPosition.get(String(position._id)) || [];
+    const totalVotesForPosition = positionVotes.length;
+    const tally = new Map();
+
+    positionVotes.forEach((vote) => {
+      const key = String(vote.candidateId);
+      tally.set(key, (tally.get(key) || 0) + 1);
+    });
+
+    let winnerCandidateId = null;
+    let winnerCandidateName = "No Clear Winner";
+    let winnerVoteCount = 0;
+    let winnerVotePercentage = 0;
+
+    if (totalVotesForPosition > 0 && tally.size > 0) {
+      const ranked = [...tally.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+      const topCount = ranked[0][1];
+      const topCandidates = ranked.filter(([, count]) => count === topCount).map(([candidateId]) => candidateId);
+      winnerVoteCount = topCount;
+      winnerVotePercentage = Number(((topCount / totalVotesForPosition) * 100).toFixed(2));
+
+      if (topCandidates.length === 1) {
+        winnerCandidateId = topCandidates[0];
+        winnerCandidateName = candidateMap.get(winnerCandidateId)?.name || "Deleted Candidate";
+      }
+    }
+
+    return {
+      electionId: election._id,
+      positionId: position._id,
+      positionName: position.name,
+      winnerCandidateId,
+      winnerCandidateName,
+      totalVotesForPosition,
+      winnerVoteCount,
+      winnerVotePercentage,
+      electionTitle: election.title,
+    };
+  });
+}
+
+async function syncVotingHistoryForElection(electionId) {
+  const rows = await buildVotingHistoryRows(electionId);
+  if (!rows) return [];
+
+  const savedRecords = [];
+  for (const row of rows) {
+    const record = await VotingHistory.findOneAndUpdate(
+      { electionId: row.electionId, positionId: row.positionId },
+      {
+        $set: {
+          positionName: row.positionName,
+          winnerCandidateId: row.winnerCandidateId,
+          winnerCandidateName: row.winnerCandidateName,
+          totalVotesForPosition: row.totalVotesForPosition,
+          winnerVoteCount: row.winnerVoteCount,
+          winnerVotePercentage: row.winnerVotePercentage,
+          electionTitle: row.electionTitle,
+        },
+        $setOnInsert: {
+          completedAt: new Date(),
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    savedRecords.push(record);
+  }
+
+  return savedRecords;
+}
+
+async function backfillVotingHistory() {
+  const finalizedElections = await Election.find({ status: { $in: ["ended", "announced"] } }).select("_id");
+  const histories = [];
+
+  for (const election of finalizedElections) {
+    const records = await syncVotingHistoryForElection(election._id);
+    histories.push(...records);
+  }
+
+  return histories;
 }
 
 async function connectMongo() {
@@ -476,6 +589,7 @@ app.get("/api/positions/public", async (req, res) => {
 
 app.get("/api/voting-history", async (req, res) => {
   try {
+    await backfillVotingHistory();
     const history = await VotingHistory.find({})
       .populate("electionId", "title")
       .populate("positionId", "name")
@@ -555,6 +669,9 @@ app.get("/api/admin/voters", authenticateAdmin, async (req, res) => {
         voterId: voter.voterId,
         registeredAt: voter.registeredAt,
         faceVerified: voter.faceVerified,
+        approvalStatus: voter.approvalStatus || "pending",
+        reviewedAt: voter.reviewedAt,
+        approvedAt: voter.approvedAt,
         votesCount: voteCount,
         createdAt: voter.createdAt,
       };
@@ -806,22 +923,30 @@ app.post("/api/voters/register", async (req, res) => {
       return res.status(400).json({ message: "⚠️ voterId and valid descriptor are required." });
     }
 
-    const existingVoter = await Voter.findOne({ voterId: String(voterId).trim() });
+    const normalizedVoterId = String(voterId).trim();
+
+    const existingVoter = await Voter.findOne({ voterId: normalizedVoterId });
     if (existingVoter) {
       return res.status(400).json({ message: "⚠️ Voter ID already registered." });
     }
 
     const voters = await Voter.find();
-    const threshold = 0.55;
     for (const voter of voters) {
       const distance = euclideanDistance(voter.descriptor, descriptor);
-      if (distance < threshold) {
+      if (distance < FACE_MATCH_THRESHOLD) {
         return res.status(400).json({ message: "⚠️ This face is already registered with another voter." });
       }
     }
 
-    await Voter.create({ voterId: String(voterId).trim(), descriptor, faceVerified: true });
-    return res.json({ message: "✅ Voter registered successfully." });
+    await Voter.create({
+      voterId: normalizedVoterId,
+      descriptor,
+      faceVerified: true,
+      approvalStatus: "pending",
+      reviewedAt: null,
+      approvedAt: null,
+    });
+    return res.json({ message: "✅ Voter registration submitted. Waiting for admin approval." });
   } catch (err) {
     console.error("❌ Voter register error:", err);
     return res.status(500).json({ message: "Server error" });
@@ -867,6 +992,9 @@ app.post("/api/voting/start", async (req, res) => {
       return res.status(400).json({ message: "⚠️ Election is not live right now." });
     }
     if (!voter) return res.status(404).json({ message: "❌ Voter not found." });
+    if (voter.approvalStatus !== "approved") {
+      return res.status(403).json({ message: "⚠️ Voter registration is awaiting admin approval." });
+    }
 
     const alreadyVoted = await Vote.findOne({ electionId: sanitizedElectionId, voterId: normalizedVoterId });
     if (alreadyVoted) {
@@ -898,6 +1026,9 @@ app.post("/api/voting/verify-face", async (req, res) => {
     if (!election) return res.status(404).json({ message: "❌ Election not found." });
     if (election.status !== "live") return res.status(400).json({ message: "⚠️ Election is not live." });
     if (!voter) return res.status(404).json({ message: "❌ Voter not found." });
+    if (voter.approvalStatus !== "approved") {
+      return res.status(403).json({ message: "⚠️ Voter registration is awaiting admin approval." });
+    }
 
     const alreadyVoted = await Vote.findOne({ electionId: sanitizedElectionId, voterId: normalizedVoterId });
     if (alreadyVoted) {
@@ -905,9 +1036,10 @@ app.post("/api/voting/verify-face", async (req, res) => {
     }
 
     const distance = euclideanDistance(voter.descriptor, descriptor);
-    const threshold = 0.55;
-    if (distance > threshold) {
-      return res.status(401).json({ message: "❌ Face verification failed." });
+    if (distance > FACE_MATCH_THRESHOLD) {
+      return res.status(401).json({
+        message: "❌ Face verification failed. Capture again in better lighting and keep your face centered.",
+      });
     }
 
     const voteToken = signVoteToken(sanitizedElectionId, normalizedVoterId);
@@ -1089,8 +1221,11 @@ app.get("/api/elections/:id/results", async (req, res) => {
 
 app.get("/api/admin/overview", authenticateAdmin, async (req, res) => {
   try {
-    const [voterCount, candidateCount, pendingCandidates, elections, voteCount] = await Promise.all([
+    const [voterCount, approvedVoterCount, pendingVoterCount, rejectedVoterCount, candidateCount, pendingCandidates, elections, voteCount] = await Promise.all([
       Voter.countDocuments(),
+      Voter.countDocuments({ approvalStatus: "approved" }),
+      Voter.countDocuments({ approvalStatus: "pending" }),
+      Voter.countDocuments({ approvalStatus: "rejected" }),
       Candidate.countDocuments({ approvalStatus: "approved" }),
       Candidate.countDocuments({ approvalStatus: "pending" }),
       Election.countDocuments(),
@@ -1099,6 +1234,9 @@ app.get("/api/admin/overview", authenticateAdmin, async (req, res) => {
 
     return res.json({
       voterCount,
+      approvedVoterCount,
+      pendingVoterCount,
+      rejectedVoterCount,
       candidateCount,
       pendingCandidates,
       elections,
@@ -1200,6 +1338,55 @@ app.put("/api/admin/candidates/:id/approval", authenticateAdmin, async (req, res
   }
 });
 
+app.put("/api/admin/voters/:id/status", authenticateAdmin, async (req, res) => {
+  try {
+    const voterId = sanitizeObjectId(req.params.id);
+    const { status } = req.body;
+
+    if (!voterId) return res.status(400).json({ message: "⚠️ Invalid voter id." });
+    if (!["approved", "rejected", "pending"].includes(String(status))) {
+      return res.status(400).json({ message: "⚠️ Invalid status." });
+    }
+
+    const voter = await Voter.findById(voterId);
+    if (!voter) return res.status(404).json({ message: "❌ Voter not found." });
+
+    const nextStatus = String(status);
+    voter.approvalStatus = nextStatus;
+    voter.reviewedAt = new Date();
+    voter.approvedAt = nextStatus === "approved" ? new Date() : null;
+    await voter.save();
+
+    return res.json({ message: `✅ Voter status updated to ${nextStatus}.` });
+  } catch (err) {
+    console.error("❌ Voter approval update error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.delete("/api/admin/voters/:id", authenticateAdmin, async (req, res) => {
+  try {
+    const voterId = sanitizeObjectId(req.params.id);
+    if (!voterId) return res.status(400).json({ message: "⚠️ Invalid voter id." });
+
+    const voter = await Voter.findById(voterId);
+    if (!voter) return res.status(404).json({ message: "❌ Voter not found." });
+
+    const [, voteDeleteResult] = await Promise.all([
+      Voter.deleteOne({ _id: voterId }),
+      Vote.deleteMany({ voterId: voter.voterId }),
+    ]);
+
+    return res.json({
+      message: "✅ Voter deleted successfully.",
+      deletedVotes: voteDeleteResult.deletedCount || 0,
+    });
+  } catch (err) {
+    console.error("❌ Voter delete error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
 app.post("/api/admin/elections", authenticateAdmin, async (req, res) => {
   try {
     const { title, positionIds, description } = req.body;
@@ -1252,6 +1439,10 @@ app.put("/api/admin/elections/:id/status", authenticateAdmin, async (req, res) =
     const election = await Election.findById(electionId).populate("positionIds");
     if (!election) return res.status(404).json({ message: "❌ Election not found." });
 
+    if (["ended", "announced"].includes(String(status))) {
+      await syncVotingHistoryForElection(election._id);
+    }
+
     election.status = String(status);
     await election.save();
 
@@ -1287,6 +1478,7 @@ app.post("/api/admin/elections/:id/announce", authenticateAdmin, async (req, res
     const election = await Election.findById(electionId);
     if (!election) return res.status(404).json({ message: "❌ Election not found." });
 
+    await syncVotingHistoryForElection(election._id);
     election.status = "announced";
     election.announcement = String(announcement || "Result announced.");
     await election.save();

@@ -94,7 +94,11 @@ export default function VotingCastFlowPage() {
       setStatus(verifyRes.data.message || "✅ Verified. Select candidate.");
       setStep(3);
     } catch (err) {
-      setStatus(err.response?.data?.message || "❌ Face verification failed.");
+      if (err.response?.status === 401) {
+        setStatus(err.response?.data?.message || "❌ Face verification failed. Please capture the face again.");
+      } else {
+        setStatus(err.response?.data?.message || "❌ Face verification failed.");
+      }
     } finally {
       setLoading(false);
     }

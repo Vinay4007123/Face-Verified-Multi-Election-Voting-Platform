@@ -7,7 +7,7 @@ const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "http://localhost:500
 export default function VoterRegistrationPage() {
   const [voterId, setVoterId] = useState("");
   const [descriptor, setDescriptor] = useState(null);
-  const [status, setStatus] = useState("Capture face and submit voter registration.");
+  const [status, setStatus] = useState("Capture face and submit voter registration. Admin approval is required before voting.");
   const [loading, setLoading] = useState(false);
 
   const registerVoter = async () => {
@@ -26,7 +26,7 @@ export default function VoterRegistrationPage() {
         voterId: voterId.trim(),
         descriptor,
       });
-      setStatus(res.data.message || "✅ Voter registered.");
+      setStatus(res.data.message || "✅ Voter registration submitted. Waiting for admin approval.");
       setVoterId("");
       setDescriptor(null);
     } catch (err) {
@@ -49,7 +49,7 @@ export default function VoterRegistrationPage() {
           style={input}
         />
 
-        <FaceCapture onEmbedding={(embedding) => { setDescriptor(embedding); setStatus("✅ Face captured. Now register voter."); }} />
+        <FaceCapture onEmbedding={(embedding) => { setDescriptor(embedding); setStatus("✅ Face captured. Submit registration for admin review."); }} />
 
         <button onClick={registerVoter} disabled={loading} style={btn}>
           {loading ? "Registering..." : "Register Voter"}

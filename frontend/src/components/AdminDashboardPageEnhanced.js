@@ -24,6 +24,7 @@ export default function AdminDashboardPageEnhanced() {
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState("dashboard");
+  const [voterFilter, setVoterFilter] = useState("all");
 
   const [newElection, setNewElection] = useState({ title: "", positionIds: [], description: "" });
   const [manualCandidate, setManualCandidate] = useState({ name: "", email: "", password: "", positionId: "", bio: "" });
@@ -31,6 +32,11 @@ export default function AdminDashboardPageEnhanced() {
 
   const [electionControl, setElectionControl] = useState({ status: "draft", resetVotes: true, clearApprovedCandidates: false });
   const [announcement, setAnnouncement] = useState("");
+
+  const filteredVoters = useMemo(() => {
+    if (voterFilter === "all") return voters;
+    return voters.filter((voter) => (voter.approvalStatus || "pending") === voterFilter);
+  }, [voters, voterFilter]);
 
   const loadAll = useCallback(async () => {
     try {
@@ -149,6 +155,23 @@ export default function AdminDashboardPageEnhanced() {
     }
   };
 
+  const updateVoterStatus = async (voterId, approvalStatus) => {
+    try {
+      setLoading(true);
+      const res = await axios.put(
+        `${API_BASE_URL}/api/admin/voters/${voterId}/status`,
+        { status: approvalStatus },
+        { headers }
+      );
+      setStatus(res.data.message || "✅ Voter status updated.");
+      await loadAll();
+    } catch (err) {
+      setStatus(err.response?.data?.message || "❌ Failed to update voter status.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const registerCandidateManually = async (e) => {
     e.preventDefault();
     if (!manualCandidate.positionId) {
@@ -187,6 +210,24 @@ export default function AdminDashboardPageEnhanced() {
       await loadAll();
     } catch (err) {
       setStatus(err.response?.data?.message || "❌ Failed to delete candidate.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteVoter = async (voterId) => {
+    if (!window.confirm("⚠️ This will delete the voter record and their cast votes permanently. Continue?")) {
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const res = await axios.delete(`${API_BASE_URL}/api/admin/voters/${voterId}`, { headers });
+      const deletedVotesText = res.data.deletedVotes ? ` (${res.data.deletedVotes} votes removed)` : "";
+      setStatus(`${res.data.message || "✅ Voter deleted."}${deletedVotesText}`);
+      await loadAll();
+    } catch (err) {
+      setStatus(err.response?.data?.message || "❌ Failed to delete voter.");
     } finally {
       setLoading(false);
     }
@@ -337,8 +378,16 @@ export default function AdminDashboardPageEnhanced() {
               <h3 style={sectionTitle}>📊 System Overview</h3>
               <div style={twoColGrid}>
                 <div style={infoCard}>
-                  <div style={infoValue}>{overview?.voterCount ?? 0}</div>
-                  <div style={infoLabel}>Registered Voters</div>
+                  <div style={infoValue}>{overview?.approvedVoterCount ?? 0}</div>
+                  <div style={infoLabel}>Approved Voters</div>
+                </div>
+                <div style={infoCard}>
+                  <div style={infoValue}>{overview?.pendingVoterCount ?? 0}</div>
+                  <div style={infoLabel}>Pending Voter Approvals</div>
+                </div>
+                <div style={infoCard}>
+                  <div style={infoValue}>{overview?.rejectedVoterCount ?? 0}</div>
+                  <div style={infoLabel}>Rejected Voters</div>
                 </div>
                 <div style={infoCard}>
                   <div style={infoValue}>{overview?.candidateCount ?? 0}</div>
@@ -765,30 +814,96 @@ export default function AdminDashboardPageEnhanced() {
         {/* Voters Tab */}
         {activeTab === "voters" && (
           <div style={sectionDiv}>
-            <h3 style={sectionTitle}>🪪 Registered Voter List</h3>
+            <h3 style={sectionTitle}>🪪 Voter Approval & Management</h3>
+            <div style={voterMenuBar}>
+              <button style={{ ...voterFilterBtn, ...(voterFilter === "all" ? voterFilterActive : {}) }} onClick={() => setVoterFilter("all")}>All</button>
+              <button style={{ ...voterFilterBtn, ...(voterFilter === "pending" ? voterFilterActive : {}) }} onClick={() => setVoterFilter("pending")}>Pending</button>
+              <button style={{ ...voterFilterBtn, ...(voterFilter === "approved" ? voterFilterActive : {}) }} onClick={() => setVoterFilter("approved")}>Approved</button>
+              <button style={{ ...voterFilterBtn, ...(voterFilter === "rejected" ? voterFilterActive : {}) }} onClick={() => setVoterFilter("rejected")}>Rejected</button>
+            </div>
+            <div style={twoColGrid}>
+              <div style={infoCard}>
+                <div style={infoValue}>{voters.length}</div>
+                <div style={infoLabel}>Total Registered Attempts</div>
+              </div>
+              <div style={infoCard}>
+                <div style={infoValue}>{voters.filter((voter) => (voter.approvalStatus || "pending") === "approved").length}</div>
+                <div style={infoLabel}>Approved & Active</div>
+              </div>
+              <div style={infoCard}>
+                <div style={infoValue}>{voters.filter((voter) => (voter.approvalStatus || "pending") === "pending").length}</div>
+                <div style={infoLabel}>Awaiting Review</div>
+              </div>
+              <div style={infoCard}>
+                <div style={infoValue}>{voters.filter((voter) => (voter.approvalStatus || "pending") === "rejected").length}</div>
+                <div style={infoLabel}>Rejected</div>
+              </div>
+            </div>
+            <p style={{ margin: "12px 0 0", color: "#475569", fontSize: "13px", fontWeight: 600 }}>
+              Registration is a one-time identity claim. Once approved, the voter can participate in any live election.
+            </p>
             <div style={tableCard}>
               <div style={tableWrapper}>
                 <table style={table}>
                   <thead>
                     <tr>
                       <th>Voter ID</th>
+                      <th>Status</th>
                       <th>Registered At</th>
                       <th>Face Verified</th>
                       <th>Votes Cast</th>
+                      <th>Action</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {voters.length === 0 ? (
+                    {filteredVoters.length === 0 ? (
                       <tr>
-                        <td colSpan="4" style={{ textAlign: "center", color: "#666" }}>No voters found</td>
+                        <td colSpan="6" style={{ textAlign: "center", color: "#666" }}>No voters found</td>
                       </tr>
                     ) : (
-                      voters.map((voter) => (
+                      filteredVoters.map((voter) => (
                         <tr key={voter._id}>
                           <td>{voter.voterId}</td>
+                          <td>
+                            <span
+                              style={{
+                                ...statusBadge,
+                                ...((voter.approvalStatus || "pending") === "approved"
+                                  ? statusApproved
+                                  : (voter.approvalStatus || "pending") === "pending"
+                                  ? statusPending
+                                  : statusRejected),
+                              }}
+                            >
+                              {voter.approvalStatus || "pending"}
+                            </span>
+                          </td>
                           <td>{new Date(voter.registeredAt || voter.createdAt).toLocaleString()}</td>
                           <td>{voter.faceVerified ? "Yes" : "No"}</td>
                           <td>{voter.votesCount || 0}</td>
+                          <td>
+                            <button
+                              style={smallApprove}
+                              onClick={() => updateVoterStatus(voter._id, "approved")}
+                              disabled={(voter.approvalStatus || "pending") === "approved"}
+                            >
+                              Approve
+                            </button>
+                            <button
+                              style={smallReject}
+                              onClick={() => updateVoterStatus(voter._id, "rejected")}
+                              disabled={(voter.approvalStatus || "pending") === "rejected"}
+                            >
+                              Reject
+                            </button>
+                            <button
+                              style={{ ...smallDeleteBtn, marginLeft: "6px" }}
+                              onClick={() => deleteVoter(voter._id)}
+                              title="Delete voter and their votes"
+                            >
+                              Delete
+                            </button>
+                          </td>
                         </tr>
                       ))
                     )}
@@ -841,6 +956,30 @@ const tabNav = {
   marginBottom: "20px",
   overflowX: "auto",
   paddingBottom: "8px",
+};
+
+const voterMenuBar = {
+  display: "flex",
+  gap: "8px",
+  flexWrap: "wrap",
+  marginBottom: "14px",
+};
+
+const voterFilterBtn = {
+  border: "1px solid #cbd5e1",
+  borderRadius: "999px",
+  background: "#fff",
+  color: "#334155",
+  padding: "8px 12px",
+  cursor: "pointer",
+  fontWeight: 700,
+  fontSize: "12px",
+};
+
+const voterFilterActive = {
+  background: "#111827",
+  color: "#fff",
+  borderColor: "#111827",
 };
 
 const tabBtn = {
