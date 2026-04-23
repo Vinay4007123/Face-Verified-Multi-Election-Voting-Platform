@@ -1038,7 +1038,7 @@ app.post("/api/voting/verify-face", async (req, res) => {
     const distance = euclideanDistance(voter.descriptor, descriptor);
     if (distance > FACE_MATCH_THRESHOLD) {
       return res.status(401).json({
-        message: "❌ Face verification failed. Capture again in better lighting and keep your face centered.",
+        message: "❌ Face verification failed. Face doesn't match.",
       });
     }
 
